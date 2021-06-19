@@ -1,0 +1,301 @@
+---
+title: "Using Postgre with R"
+output: html_notebook
+---
+
+First, we need to establish a connection with our database. For this, we will use the RPostgres and 
+
+```{r}
+library(DBI)
+library(RPostgres)
+library(tidyverse)
+```
+
+Now, we'll create our connection.
+```{r}
+con <- dbConnect(RPostgres::Postgres(),      # Use the postgres driver
+                 dbname = 'prescribers',     # Name of the database we want to connect to
+                 host = 'localhost',         # 'localhost' or eg. 'ec2-54-83-201-96.compute-1.amazonaws.com'
+                 port = 5432, 
+                 user = 'postgres',
+                 password = 'postgres')
+```
+
+We can see the tables in the database.
+```{r}
+dbListTables(con)
+```
+
+We can even see the columns of a particular table.
+```{r}
+dbListFields(con, 'drug')
+```
+
+To execute a query, we can use the dbSendQuery function
+```{r}
+# proportion of opioid prescriptions (step 1)
+query = "SELECT f.fipscounty, f.county , SUM(total_claim_count) as total, population
+FROM drug AS d
+INNER JOIN prescription AS p2
+USING (drug_name)
+INNER JOIN prescriber AS p1
+USING (npi)
+INNER JOIN zip_fips AS z
+ON p1.nppes_provider_zip5 = z.zip
+INNER JOIN fips_county as f
+USING (fipscounty)
+INNER JOIN population as p3
+USING (fipscounty)
+WHERE f.state = 'TN' AND opioid_drug_flag = 'Y'
+GROUP BY f.fipscounty, f.county, population
+ORDER BY total DESC;"
+
+res <- dbSendQuery(con, query)
+```
+
+Then to retrieve the results, we can use dbFetch. Note that you can fetch only a portion of the results if needed, but we'll fetch everything.
+```{r}
+prescribers <- dbFetch(res)
+
+# It is good practice to clear the result after fetching what you need in order to free all resources associated with the result set. 
+dbClearResult(res)
+```
+
+The results that are returned come through as a dataframe, so we can manipulate it using tidyverse.
+```{r}
+# prescribers %>% 
+#   filter(nppes_provider_city == 'NASHVILLE')
+
+# oroportion (step 2)
+prescribers1 <-prescribers %>%
+  mutate(opioid_proportion = total / sum(total) * 100,
+         pop_proportion = population / sum(population) * 100,
+         opioid_per_pop = total / population) %>%
+  arrange(desc(opioid_per_pop))
+
+prescribers1 %>% 
+  head(15) %>% 
+  ggplot(aes(x=opioid_per_pop, y=reorder(county, opioid_per_pop))) + geom_col()
+
+```
+```{r}
+# explorting overdose deaths by county
+query = "SELECT SUM(overdose_deaths), fipscounty
+FROM overdose_deaths
+GROUP BY fipscounty;"
+
+res <- dbSendQuery(con, query)
+```
+
+```{r}
+overdose <- dbFetch(res)
+
+# It is good practice to clear the result after fetching what you need in order to free all resources associated with the result set. 
+dbClearResult(res)
+```
+
+```{r}
+# prescribers %>% 
+#   filter(nppes_provider_city == 'NASHVILLE')
+
+#proportion (step 2)
+overdose1 <-overdose %>%
+  left_join(prescribers1, by = "fipscounty") %>% 
+  mutate(prop_deaths = sum / population * 100)
+
+overdose1%>% 
+  ggplot(aes(x = opioid_per_pop, y = prop_deaths)) +
+  geom_point() +
+  scale_x_log10()
+  
+```
+```{r}
+cor(overdose1$opioid_per_pop, overdose1$prop_deaths)
+```
+
+
+```{r}
+library(maps)
+library(plotly)
+library(colorspace)
+library(tidyverse)
+library(ggplot2)
+# install.packages("ggiraph")
+library(ggiraph)
+```
+
+```{r}
+states <- map_data("state")
+
+head(states)
+
+states <- map_data("state")
+tn<-subset(states, region %in% c("tennessee"))
+tn_df<-subset(states, region=="tennessee")
+counties<-map_data("county")
+tn_county<-subset(counties, region=="tennessee")
+tn_base <- ggplot(data = tn_df, mapping = aes(x = long, y = lat, group = group)) + 
+  coord_fixed(1.3) + 
+  geom_polygon(color = "black", fill = "gray")
+tn_base +  
+  geom_polygon(data = tn_county, fill = NA, color = "white") +
+  geom_polygon(color = "black", fill = NA)
+
+```
+```{r}
+# change column names to uppercase; then rename
+tn_county[,6] = toupper(tn_county[,6])
+tn_county <- tn_county %>% 
+  rename(county = subregion) %>% 
+  mutate(county = str_replace_all(county, " ", ""))
+
+overdose1 <- overdose1 %>% 
+  mutate(county = str_replace_all(county, " ", ""))
+
+future_tibble <- tn_county %>% 
+  inner_join(overdose1, by = "county")
+  
+
+```
+
+```{r}
+ditch_the_axes <- theme(
+  axis.text = element_blank(),
+  axis.line = element_blank(),
+  axis.ticks = element_blank(),
+  panel.border = element_blank(),
+  panel.grid = element_blank(),
+  axis.title = element_blank())
+```
+
+
+```{r}
+elb<-tn_base + 
+  geom_polygon(data = future_tibble, aes(fill = prop_deaths, text = sprintf('County: %s\nDeath Proportion: %s', county,round(prop_deaths,2))), color = "black") +
+  geom_polygon(color = "black") +
+  theme_bw() +
+  ditch_the_axes
+```
+
+```{r}
+elb<-elb +
+            scale_fill_gradientn(colours = colorspace::diverging_hcl(3,palette = "Blue-Red"))
+
+```
+
+```{r}
+ggplotly(elb,tooltip = "text")
+```
+
+```{r}
+# Question 3
+q3_query = "SELECT *
+FROM drug AS d
+INNER JOIN prescription AS p2
+USING (drug_name)
+INNER JOIN prescriber AS p1
+USING (npi)
+INNER JOIN zip_fips AS z
+ON p1.nppes_provider_zip5 = z.zip
+INNER JOIN fips_county as f
+USING (fipscounty)
+INNER JOIN overdose_deaths as o
+USING (fipscounty)
+WHERE f.state = 'TN' AND opioid_drug_flag = 'Y' AND YEAR BETWEEN 2015 AND 2018
+ORDER BY overdose_deaths DESC;"
+
+q3_res <- dbSendQuery(con, q3_query)
+```
+
+```{r}
+od_trend <- dbFetch(q3_res)
+
+# It is good practice to clear the result after fetching what you need in order to free all resources associated with the result set. 
+dbClearResult(q3_res)
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+# Question 5
+query2 = "With CTE AS (
+	SELECT
+	fipscounty, zip, tot_ratio AS highest_ratio,
+	RANK() OVER(
+		PARTITION BY zip
+		ORDER BY tot_ratio DESC)
+	FROM zip_fips
+	WHERE fipscounty LIKE '47%'
+	ORDER BY zip
+),
+CTE2 AS (
+	SELECT fipscounty, zip
+	FROM CTE
+	WHERE rank = 1)
+SELECT p.npi, CTE2.zip, CTE2.fipscounty, fp.county, drug_name, generic_name, p.total_day_supply, p.total_claim_count, 
+CASE WHEN d.generic_name LIKE '%%CODEINE%%' THEN 'CODEINE'
+            WHEN d.generic_name LIKE '%%FENTANYL%%' THEN 'FENTANYL'
+            WHEN d.generic_name LIKE '%%HYDROCODONE%%' THEN 'HYDROCODONE'
+            WHEN d.generic_name LIKE '%%MORPHINE%%' THEN 'MORPHINE'
+            WHEN d.generic_name LIKE '%%OXYCODONE%%' THEN 'OXYCODONE'
+            WHEN d.generic_name LIKE '%%OXYMORPHONE%%' THEN 'OXYMORPHONE'
+            WHEN d.generic_name LIKE '%%TRAMADOL%%' THEN 'TRAMADOL'
+            ELSE 'other' END 
+            AS opioid
+FROM drug AS d
+INNER JOIN prescription as p
+USING (drug_name)
+INNER JOIN prescriber as p2
+USING (npi)
+INNER JOIN CTE2
+On p2.nppes_provider_zip5 = CTE2.zip
+INNER JOIN fips_county AS fp
+USING(fipscounty)
+WHERE opioid_drug_flag = 'Y'
+ORDER BY p.total_day_supply desc;"
+
+res2 <- dbSendQuery(con, query2)
+```
+
+```{r}
+drugs <- dbFetch(res2)
+
+# It is good practice to clear the result after fetching what you need in order to free all resources associated with the result set. 
+dbClearResult(res2)
+```
+
+```{r}
+query1 = "SELECT fipscounty, SUM(overdose_deaths) AS deaths_fipscounty, population
+FROM overdose_deaths
+INNER JOIN population
+USING(fipscounty)
+GROUP BY fipscounty, population;"
+
+res1 <- dbSendQuery(con, query1)
+```
+
+```{r}
+overdose_deaths <- dbFetch(res1)
+
+# It is good practice to clear the result after fetching what you need in order to free all resources associated with the result set. 
+dbClearResult(res1)
+```
+
+```{r}
+all_opioid_data <- overdose_deaths %>% 
+  inner_join(drugs, by = "fipscounty") %>% 
+  mutate(prop_deaths = deaths_fipscounty / population * 100)
+
+```
+
+```{r}
+
+
+```
+

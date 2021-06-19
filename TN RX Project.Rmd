@@ -1,0 +1,77 @@
+---
+title: "Using Postgre with R"
+output: html_notebook
+---
+
+First, we need to establish a connection with our database. For this, we will use the RPostgres and 
+
+```{r}
+library(DBI)
+library(RPostgres)
+library(tidyverse)
+options(scipen = 999)
+```
+
+Now, we'll create our connection.
+```{r}
+con <- dbConnect(RPostgres::Postgres(),      # Use the postgres driver
+                 dbname = 'prescribers',     # Name of the database we want to connect to
+                 host = 'localhost',         # 'localhost' or eg. 'ec2-54-83-201-96.compute-1.amazonaws.com'
+                 port = 5432, 
+                 user = 'postgres',
+                 password = 'postgres')
+```
+
+We can see the tables in the database.
+```{r}
+dbListTables(con)
+```
+
+We can even see the columns of a particular table.
+```{r}
+dbListFields(con, 'drug')
+```
+
+To execute a query, we can use the dbSendQuery function
+```{r}
+query = "SELECT f.county , SUM(total_claim_count) as total, population
+FROM drug AS d
+INNER JOIN prescription AS p2
+USING (drug_name)
+INNER JOIN prescriber AS p1
+USING (npi)
+INNER JOIN zip_fips AS z
+ON p1.nppes_provider_zip5 = z.zip
+INNER JOIN fips_county as f
+USING (fipscounty)
+INNER JOIN population as p3
+USING (fipscounty)
+WHERE f.state = 'TN' AND opioid_drug_flag = 'Y'
+GROUP BY f.county, population
+ORDER BY total DESC;
+"
+
+res <- dbSendQuery(con, query)
+```
+
+Then to retrieve the results, we can use dbFetch. Note that you can fetch only a portion of the results if needed, but we'll fetch everything.
+```{r}
+prescribers <- dbFetch(res)
+
+# It is good practice to clear the result after fetching what you need in order to free all resources associated with the result set. 
+dbClearResult(res)
+```
+
+The results that are returned come through as a dataframe, so we can manipulate it using tidyverse.
+```{r}
+prescribers1 <-prescribers %>%
+  mutate(opioid_proportion = total / sum(total) * 100,
+         pop_proportion = population / sum(population) * 100,
+         opioid_per_pop = total / population) %>%
+  arrange(desc(opioid_per_pop))
+
+prescribers1 %>% 
+  head(15) %>% 
+  ggplot(aes(x=opioid_per_pop, y=reorder(county, opioid_per_pop))) + geom_col()
+
+```
